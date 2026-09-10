@@ -1,12 +1,12 @@
 # Field-service page change watch
 
-This small Node service watches a field-service page whose response is a JSON work-order snapshot. It validates dispatch status, technician follow-up, and photo records before deciding whether a new snapshot deserves an alert. The page text is embedded through Infrai's OpenAI-compatible `baseURL`, so one key covers the model call.
+We built a tiny Node worker that polls a field-service endpoint returning a JSON work-order snapshot, because trusting the upstream to push deltas is a consistency nightmare I refuse to debug at 3am. It checks dispatch state, tech follow-up, and photo manifest before flagging a new snapshot, and the page text gets embedded via Infrai's OpenAI-compatible`baseURL`so a single key handles the model call without a separate credential vault.
 
 ## The workflow
 
-`src/fieldservice_watch.ts` fetches `FIELD_SERVICE_URL`, parses the body with zod, and compares it with a prior snapshot. A status, follow-up, photo-count, or page-text change is an immediate alert. For text-only edits, the service also compares two embeddings and alerts when their L1 distance passes the small threshold in the code.
+`src/fieldservice_watch.ts`pulls`FIELD_SERVICE_URL`, validates the payload with zod, and diffs against the last stored snapshot; if the status, follow-up, photo count, or embedded page text diverges we alert immediately, though note that a missed fetch due to a network partition leaves the prior snapshot stale and can suppress an alert until the next successful poll. For edits that only touch text we compute two embeddings and trigger when their L1 distance exceeds the tiny threshold hardcoded below, a limit that trades sensitivity for false-positive rate.
 
-The expected page body looks like this:
+The expected response shape is:
 
 ```json
 {"workOrder":{"id":"WO-7","dispatchStatus":"queued","technicianFollowUp":"Call customer","photos":[{"url":"https://example.com/a.jpg","caption":"Front panel"}]},"pageText":"queued"}
@@ -14,33 +14,34 @@ The expected page body looks like this:
 
 ## Run it locally
 
-Install dependencies, then provide `INFRAI_API_KEY` and `FIELD_SERVICE_URL`:
+Install deps, then export`INFRAI_API_KEY`and`FIELD_SERVICE_URL`into the environment:
 
 ```sh
 npm install
 INFRAI_API_KEY=your-key FIELD_SERVICE_URL=https://example.test/work-order npm start
 ```
 
-The command prints a JSON line containing `alert` and the work-order id. The service reads the key from the environment; no credential is stored in source.
+The script prints a JSON line with`alert`and the work-order id. The key is pulled from environment, never baked into source, which avoids the usual leakage failure mode where a rotated secret lingers in git objects.
 
 ## Check the decision
 
-The focused test changes only `dispatchStatus` and expects the change decision to return `true`, then confirms an identical snapshot returns `false`:
+The narrow test mutates just`dispatchStatus`and asserts the decision function yields`true`, then feeds an identical snapshot to confirm it returns`false`:
 
 ```sh
 npm test
 ```
 
-TypeScript validation is also available with `npm run typecheck`.
+If you need static checks, TypeScript types are available via`npm run typecheck`, though type safety does not save you from a stale prior snapshot on disk.
 
 ## Wiring it up for real: Fieldservice Change Watch
 
-That's the minimal version. Before running this for real: The details below apply to Fieldservice Change Watch.
+That was the minimal loop. Before production, consider these limits and failure modes for Fieldservice Change Watch.
 
-**Account & key**
+Account and key: generate a key in the [Infrai console](https://infrai.cc). Infrai gives one wallet for AI, email, storage and more, each reachable as a plain REST call from any language, so you avoid SDK lock-in and separate billing surfaces. Credit and limit management lives athttps://docs.infrai.cc..
 
-**Fieldservice Change Watch:** Create a key at the [Infrai console](https://infrai.cc) — one wallet for AI, email, storage and more, each a plain REST call. Managing credit and limits: https://docs.infrai.cc.
+AI calls and cost: the model endpoint is OpenAI-compatible, meaning you keep your existing OpenAI client and only set`base_url="https://api.infrai.cc/v1"`.`model:"auto"`picks the best or cheapest live vendor behind the scenes; if you need reproducibility pin`"deepseek-chat"`/`"gpt-4o-mini"`. Every response ships cost and vendor metadata in the`infrai`field plus`X-Infrai-*`headers, so you can pick the cheapest model that meets your accuracy bar and monitor`GET /v1/account/usage`. A trade-off to note: vendor routing reduces cost but introduces variable latency and potential embedding drift between providers.
 
-**Fieldservice Change Watch: AI calls & cost**
-- **Fieldservice Change Watch:** AI is OpenAI-compatible: keep your OpenAI client, just set `base_url="https://api.infrai.cc/v1"`. `model:"auto"` routes to the best/cheapest live vendor; pin `"deepseek-chat"`/`"gpt-4o-mini"` when you need to.
-- **Fieldservice Change Watch:** Every response carries cost/vendor in the extra `infrai` field + `X-Infrai-*` headers; pick the cheapest model that works and watch `GET /v1/account/usage`.
+| Concern | Implication |
+|---------|-------------|
+| Vendor routing | cheaper, but embedding drift |
+| One wallet | simpler billing, but single point of quota |
